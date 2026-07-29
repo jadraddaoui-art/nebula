@@ -199,7 +199,7 @@ func ipv4CreateRejectTCPPacket(packet []byte, out []byte) []byte {
 }
 
 func ipv6CreateRejectPacket(packet []byte, out []byte) []byte {
-	proto, offset, isFragment := ipv6FindUpperProtocol(packet)
+	proto, offset, isFragment := IPv6FindUpperProtocol(packet)
 	if isFragment {
 		return nil
 	}
@@ -333,11 +333,34 @@ func ipv6CreateRejectTCPPacket(packet []byte, out []byte, offset int) []byte {
 	return out
 }
 
-func ipv6FindUpperProtocol(packet []byte) (nextHeader uint8, offset int, isFragment bool) {
+// maxIPv6ExtHeaders caps the extension-header walk in IPv6FindUpperProtocol.
+// RFC 8200 legal chains are shorter (each header at most once, Destination
+// Options at most twice), so the cap only bites crafted packets, which would
+// otherwise make us walk their whole payload 8 bytes at a time.
+const maxIPv6ExtHeaders = 8
+
+// IPv6FindUpperProtocol walks packet's IPv6 extension-header chain and
+// returns the terminal (upper-layer) protocol number, the byte offset where
+// that protocol's header begins, and whether the packet is a non-first
+// fragment. It steps over Hop-by-Hop (0), Routing (43), Fragment (44),
+// AH (51), and Destination Options (60); anything else — including ESP,
+// whose payload is encrypted — terminates the walk.
+//
+// For a non-first fragment, nextHeader still names the flow's upper
+// protocol (copied from the fragment header) but offset points at fragment
+// payload, not a real transport header: consult isFragment before
+// dereferencing offset. If the chain is truncated, over-long, or the packet
+// is shorter than an IPv6 header, the walk stops early and nextHeader is
+// whatever it stopped on (59, IPPROTO_NONE, for the too-short case) —
+// callers treat any non-transport result as unclassifiable.
+func IPv6FindUpperProtocol(packet []byte) (nextHeader uint8, offset int, isFragment bool) {
+	if len(packet) < ipv6.HeaderLen {
+		return 59, 0, false // IPPROTO_NONE: nothing to classify
+	}
 	nextHeader = packet[6]
 	offset = ipv6.HeaderLen
 
-	for {
+	for range maxIPv6ExtHeaders {
 		switch nextHeader {
 		case 0, 43, 60: // Hop-by-Hop, Routing, Destination
 			if len(packet) < offset+2 {
@@ -367,6 +390,7 @@ func ipv6FindUpperProtocol(packet []byte) (nextHeader uint8, offset int, isFragm
 			return nextHeader, offset, isFragment
 		}
 	}
+	return nextHeader, offset, isFragment
 }
 
 func CreateICMPEchoResponse(packet, out []byte) []byte {

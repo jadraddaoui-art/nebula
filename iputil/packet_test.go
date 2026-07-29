@@ -515,3 +515,121 @@ func TestCreateICMPEchoResponse_IPv6_NotICMPv6(t *testing.T) {
 	result := CreateICMPEchoResponse(packet, out)
 	assert.Nil(t, result)
 }
+
+func TestIPv6FindUpperProtocol(t *testing.T) {
+	src := net.ParseIP("fd00::1")
+	dst := net.ParseIP("fd00::2")
+
+	// extHdr builds one 8-byte-unit extension header: next, hdrExtLen
+	// ((extra+1)*8 bytes total), padded to size.
+	extHdr := func(next uint8, extra int) []byte {
+		b := make([]byte, (extra+1)*8)
+		b[0] = next
+		b[1] = uint8(extra)
+		return b
+	}
+
+	t.Run("no extension headers", func(t *testing.T) {
+		for _, proto := range []uint8{6, 17, 58} {
+			nh, offset, frag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, proto, make([]byte, 20)))
+			assert.Equal(t, proto, nh)
+			assert.Equal(t, ipv6.HeaderLen, offset)
+			assert.False(t, frag)
+		}
+	})
+
+	t.Run("hop-by-hop then TCP", func(t *testing.T) {
+		payload := append(extHdr(6, 0), make([]byte, 20)...)
+		nh, offset, frag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 0, payload))
+		assert.Equal(t, uint8(6), nh)
+		assert.Equal(t, ipv6.HeaderLen+8, offset)
+		assert.False(t, frag)
+	})
+
+	t.Run("chained headers honor length units", func(t *testing.T) {
+		// Hop-by-Hop (8B) -> Dest Options (16B) -> Routing (8B) -> UDP.
+		payload := extHdr(60, 0)
+		payload = append(payload, extHdr(43, 1)...)
+		payload = append(payload, extHdr(17, 0)...)
+		payload = append(payload, make([]byte, 8)...)
+		nh, offset, frag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 0, payload))
+		assert.Equal(t, uint8(17), nh)
+		assert.Equal(t, ipv6.HeaderLen+8+16+8, offset)
+		assert.False(t, frag)
+	})
+
+	t.Run("AH length is in 4-byte units plus 2", func(t *testing.T) {
+		// AH payload-len byte 4 -> (4+2)*4 = 24 bytes on the wire.
+		ah := make([]byte, 24)
+		ah[0] = 6
+		ah[1] = 4
+		payload := append(ah, make([]byte, 20)...)
+		nh, offset, frag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 51, payload))
+		assert.Equal(t, uint8(6), nh)
+		assert.Equal(t, ipv6.HeaderLen+24, offset)
+		assert.False(t, frag)
+	})
+
+	t.Run("first fragment walks to the transport header", func(t *testing.T) {
+		frag := make([]byte, 8)
+		frag[0] = 17
+		binary.BigEndian.PutUint16(frag[2:4], 0x0001) // offset 0, M=1
+		payload := append(frag, make([]byte, 8)...)
+		nh, offset, isFrag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 44, payload))
+		assert.Equal(t, uint8(17), nh)
+		assert.Equal(t, ipv6.HeaderLen+8, offset)
+		assert.False(t, isFrag, "first fragment carries the real transport header")
+	})
+
+	t.Run("non-first fragment is flagged", func(t *testing.T) {
+		frag := make([]byte, 8)
+		frag[0] = 17
+		binary.BigEndian.PutUint16(frag[2:4], 1<<3) // offset 1, M=0
+		payload := append(frag, make([]byte, 8)...)
+		nh, _, isFrag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 44, payload))
+		assert.Equal(t, uint8(17), nh, "fragment header still names the flow's L4")
+		assert.True(t, isFrag, "offset points at fragment payload, not a header")
+	})
+
+	t.Run("ESP terminates the walk", func(t *testing.T) {
+		nh, offset, frag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 50, make([]byte, 16)))
+		assert.Equal(t, uint8(50), nh)
+		assert.Equal(t, ipv6.HeaderLen, offset)
+		assert.False(t, frag)
+	})
+
+	t.Run("unknown protocol terminates the walk", func(t *testing.T) {
+		nh, offset, _ := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 132, make([]byte, 16))) // SCTP
+		assert.Equal(t, uint8(132), nh)
+		assert.Equal(t, ipv6.HeaderLen, offset)
+	})
+
+	t.Run("truncated extension header stops the walk", func(t *testing.T) {
+		// Next header says Hop-by-Hop but the packet ends at the IPv6 header.
+		nh, offset, frag := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 0, nil))
+		assert.Equal(t, uint8(0), nh, "unresolvable chain returns the extension header it stopped on")
+		assert.Equal(t, ipv6.HeaderLen, offset)
+		assert.False(t, frag)
+	})
+
+	t.Run("crafted over-long chain hits the cap", func(t *testing.T) {
+		// Ten chained Hop-by-Hop headers, then TCP. Illegal per RFC 8200
+		// (Hop-by-Hop may only appear first); the cap must stop the walk
+		// before it resolves rather than crawling arbitrary crafted chains.
+		var payload []byte
+		for i := 0; i < 9; i++ {
+			payload = append(payload, extHdr(0, 0)...)
+		}
+		payload = append(payload, extHdr(6, 0)...)
+		payload = append(payload, make([]byte, 20)...)
+		nh, _, _ := IPv6FindUpperProtocol(makeIPv6Packet(src, dst, 0, payload))
+		assert.Equal(t, uint8(0), nh, "walk must stop at the cap, not resolve to TCP")
+	})
+
+	t.Run("packet shorter than an IPv6 header", func(t *testing.T) {
+		nh, offset, frag := IPv6FindUpperProtocol(make([]byte, 39))
+		assert.Equal(t, uint8(59), nh) // IPPROTO_NONE
+		assert.Equal(t, 0, offset)
+		assert.False(t, frag)
+	})
+}
