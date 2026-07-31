@@ -25,18 +25,17 @@ import (
 )
 
 type tun struct {
-	readers         tio.QueueSet
-	closeLock       sync.Mutex
-	Device          string
-	vpnNetworks     []netip.Prefix
-	MaxMTU          int
-	DefaultMTU      int
-	TXQueueLen      int
-	deviceIndex     int
-	ioctlFd         uintptr
-	vnetHdr         bool
-	offloadFlags    uint
-	routeFeatureECN bool
+	readers      tio.QueueSet
+	closeLock    sync.Mutex
+	Device       string
+	vpnNetworks  []netip.Prefix
+	MaxMTU       int
+	DefaultMTU   int
+	TXQueueLen   int
+	deviceIndex  int
+	ioctlFd      uintptr
+	vnetHdr      bool
+	offloadFlags uint
 
 	Routes                    atomic.Pointer[[]Route]
 	routeTree                 atomic.Pointer[bart.Table[routing.Gateways]]
@@ -223,7 +222,6 @@ func newTunGeneric(c *config.C, l *slog.Logger, fd int, vnetHdr bool, offloadFla
 		TXQueueLen:                c.GetInt("tun.tx_queue", 500),
 		useSystemRoutes:           c.GetBool("tun.use_system_route_table", false),
 		useSystemRoutesBufferSize: c.GetInt("tun.use_system_route_table_buffer_size", 0),
-		routeFeatureECN:           c.GetBool("tunnels.ecn", true), //todo!!!
 		routesFromSystem:          map[netip.Prefix]routing.Gateways{},
 		l:                         l,
 	}
@@ -534,9 +532,6 @@ func (t *tun) setDefaultRoute(cidr netip.Prefix) error {
 	if cidr.Addr().Is6() {
 		nr.Priority = 256
 	}
-	if t.routeFeatureECN {
-		nr.Features |= unix.RTAX_FEATURE_ECN
-	}
 	err := netlink.RouteReplace(&nr)
 	if err != nil {
 		t.l.Warn("Failed to set default route MTU, retrying", "error", err, "cidr", cidr)
@@ -585,9 +580,6 @@ func (t *tun) addRoutes(logErrors bool) error {
 
 		if r.Metric > 0 {
 			nr.Priority = r.Metric
-		}
-		if t.routeFeatureECN {
-			nr.Features |= unix.RTAX_FEATURE_ECN
 		}
 
 		err := netlink.RouteReplace(&nr)
