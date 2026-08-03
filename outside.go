@@ -13,6 +13,7 @@ import (
 
 	"github.com/slackhq/nebula/firewall"
 	"github.com/slackhq/nebula/header"
+	"github.com/slackhq/nebula/overlay/batch"
 	"golang.org/x/net/ipv4"
 )
 
@@ -143,7 +144,7 @@ func (f *Interface) readOutsidePackets(via ViaSender, scratch []byte, packet []b
 	case header.Message:
 		switch h.Subtype {
 		case header.MessageNone:
-			f.handleOutsideMessagePacket(hostinfo, out, scratch, fwPacket, nb, q, localCache)
+			f.handleOutsideMessagePacket(hostinfo, h.MessageCounter, out, scratch, fwPacket, nb, q, localCache)
 		default:
 			hostinfo.logger(f.l).Error("IsValidSubType was true, but unexpected message subtype seen", "from", via, "header", h)
 			return
@@ -500,7 +501,7 @@ func parseV4(data []byte, incoming bool, fp *firewall.Packet) error {
 	return nil
 }
 
-func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, out []byte, scratch []byte, fwPacket *firewall.Packet, nb []byte, q int, localCache firewall.ConntrackCache) {
+func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, messageCounter uint64, out []byte, scratch []byte, fwPacket *firewall.Packet, nb []byte, q int, localCache firewall.ConntrackCache) {
 	err := newPacket(out, true, fwPacket)
 	if err != nil {
 		hostinfo.logger(f.l).Warn("Error while validating inbound packet",
@@ -522,7 +523,7 @@ func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, out []byte, s
 		return
 	}
 
-	err = f.batchers[q].Commit(out)
+	err = f.batchers[q].Commit(out, batch.SortKey{Epoch: hostinfo.ConnectionState.epoch, Counter: messageCounter})
 	if err != nil {
 		f.l.Error("Failed to write to tun", "error", err)
 	}
