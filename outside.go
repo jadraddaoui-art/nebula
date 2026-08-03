@@ -26,7 +26,7 @@ var ErrOutOfWindow = errors.New("out of window packet")
 // readOutsidePackets processes one received underlay packet.
 // Message payloads are decrypted IN PLACE, so packet must stay untouched
 // by the caller until the batcher for queue q has been flushed
-func (f *Interface) readOutsidePackets(via ViaSender, scratch []byte, packet []byte, h *header.H, fwPacket *firewall.Packet, lhf *LightHouseHandler, nb []byte, q int, localCache firewall.ConntrackCache) {
+func (f *Interface) readOutsidePackets(via ViaSender, scratch []byte, packet []byte, h *header.H, fwPacket *firewall.ParsedPacket, lhf *LightHouseHandler, nb []byte, q int, localCache firewall.ConntrackCache) {
 	err := h.Parse(packet)
 	if err != nil {
 		// Hole punch packets are 0 or 1 byte big, so lets ignore printing those errors
@@ -186,7 +186,7 @@ func (f *Interface) readOutsidePackets(via ViaSender, scratch []byte, packet []b
 	}
 }
 
-func (f *Interface) handleOutsideRelayPacket(hostinfo *HostInfo, via ViaSender, scratch []byte, packet []byte, h *header.H, fwPacket *firewall.Packet, lhf *LightHouseHandler, nb []byte, q int, localCache firewall.ConntrackCache) {
+func (f *Interface) handleOutsideRelayPacket(hostinfo *HostInfo, via ViaSender, scratch []byte, packet []byte, h *header.H, fwPacket *firewall.ParsedPacket, lhf *LightHouseHandler, nb []byte, q int, localCache firewall.ConntrackCache) {
 	// Successfully validated the thing. Get rid of the Relay header and the AEAD tag
 	signedPayload := packet[header.Len : len(packet)-hostinfo.ConnectionState.dKey.Overhead()]
 	// Pull the Roaming parts up here, and return in all call paths.
@@ -315,7 +315,11 @@ var (
 )
 
 // newPacket validates and parses the interesting bits for the firewall out of the ip and sub protocol headers
-func newPacket(data []byte, incoming bool, fp *firewall.Packet) error {
+func newPacket(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
+	// fp is reused across packets; reset the parse byproducts here so a
+	// parser's early-error return can't leak the previous packet's offsets.
+	fp.IPHdrLen = 0
+	fp.FragAny = false
 	if len(data) < 1 {
 		return ErrPacketTooShort
 	}
@@ -330,7 +334,7 @@ func newPacket(data []byte, incoming bool, fp *firewall.Packet) error {
 	return ErrUnknownIPVersion
 }
 
-func parseV6(data []byte, incoming bool, fp *firewall.Packet) error {
+func parseV6(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
 	dataLen := len(data)
 	if dataLen < ipv6.HeaderLen {
 		return ErrIPv6PacketTooShort
@@ -356,6 +360,7 @@ func parseV6(data []byte, incoming bool, fp *firewall.Packet) error {
 		switch proto {
 		case layers.IPProtocolESP, layers.IPProtocolNoNextHeader:
 			fp.Protocol = uint8(proto)
+			fp.IPHdrLen = offset
 			fp.RemotePort = 0
 			fp.LocalPort = 0
 			fp.Fragment = false
@@ -366,6 +371,7 @@ func parseV6(data []byte, incoming bool, fp *firewall.Packet) error {
 				return ErrIPv6PacketTooShort
 			}
 			fp.Protocol = uint8(proto)
+			fp.IPHdrLen = offset
 			fp.LocalPort = 0 //incoming vs outgoing doesn't matter for icmpv6
 			icmptype := data[offset+1]
 			switch icmptype {
@@ -383,6 +389,9 @@ func parseV6(data []byte, incoming bool, fp *firewall.Packet) error {
 			}
 
 			fp.Protocol = uint8(proto)
+			// offset is the L4 header start: 40 for a plain packet, past the
+			// extension chain otherwise. The coalescer only accepts 40.
+			fp.IPHdrLen = offset
 			if incoming {
 				fp.RemotePort = binary.BigEndian.Uint16(data[offset : offset+2])
 				fp.LocalPort = binary.BigEndian.Uint16(data[offset+2 : offset+4])
@@ -399,6 +408,10 @@ func parseV6(data []byte, incoming bool, fp *firewall.Packet) error {
 			if dataLen < offset+8 {
 				return ErrIPv6PacketTooShort
 			}
+
+			// Either way this packet is a fragment shape the coalescer must
+			// not touch, first fragment included.
+			fp.FragAny = true
 
 			// Check if this is the first fragment
 			fragmentOffset := binary.BigEndian.Uint16(data[offset+2:offset+4]) &^ uint16(0x7) // Remove the reserved and M flag bits
@@ -441,7 +454,7 @@ func parseV6(data []byte, incoming bool, fp *firewall.Packet) error {
 	return ErrIPv6CouldNotFindPayload
 }
 
-func parseV4(data []byte, incoming bool, fp *firewall.Packet) error {
+func parseV4(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
 	// Do we at least have an ipv4 header worth of data?
 	if len(data) < ipv4.HeaderLen {
 		return ErrIPv4PacketTooShort
@@ -458,6 +471,10 @@ func parseV4(data []byte, incoming bool, fp *firewall.Packet) error {
 	// Check if this is the second or further fragment of a fragmented packet.
 	flagsfrags := binary.BigEndian.Uint16(data[6:8])
 	fp.Fragment = (flagsfrags & 0x1FFF) != 0
+	// Any fragmentation at all (MF or offset): first fragments have readable
+	// ports for the firewall but must never be coalesced.
+	fp.FragAny = (flagsfrags & 0x3fff) != 0
+	fp.IPHdrLen = ihl
 
 	// Firewall handles protocol checks
 	fp.Protocol = data[9]
@@ -501,7 +518,7 @@ func parseV4(data []byte, incoming bool, fp *firewall.Packet) error {
 	return nil
 }
 
-func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, messageCounter uint64, out []byte, scratch []byte, fwPacket *firewall.Packet, nb []byte, q int, localCache firewall.ConntrackCache) {
+func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, messageCounter uint64, out []byte, scratch []byte, fwPacket *firewall.ParsedPacket, nb []byte, q int, localCache firewall.ConntrackCache) {
 	err := newPacket(out, true, fwPacket)
 	if err != nil {
 		hostinfo.logger(f.l).Warn("Error while validating inbound packet",
@@ -511,7 +528,7 @@ func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, messageCounte
 		return
 	}
 
-	dropReason := f.firewall.Drop(*fwPacket, true, hostinfo, f.pki.GetCAPool(), localCache)
+	dropReason := f.firewall.Drop(fwPacket.Packet, true, hostinfo, f.pki.GetCAPool(), localCache)
 	if dropReason != nil {
 		f.rejectOutside(out, hostinfo.ConnectionState, hostinfo, nb, scratch, q)
 		if f.l.Enabled(context.Background(), slog.LevelDebug) {
@@ -523,7 +540,7 @@ func (f *Interface) handleOutsideMessagePacket(hostinfo *HostInfo, messageCounte
 		return
 	}
 
-	err = f.batchers[q].Commit(out, batch.SortKey{Epoch: hostinfo.ConnectionState.epoch, Counter: messageCounter})
+	err = f.batchers[q].Commit(out, batch.SortKey{Epoch: hostinfo.ConnectionState.epoch, Counter: messageCounter}, fwPacket)
 	if err != nil {
 		f.l.Error("Failed to write to tun", "error", err)
 	}
