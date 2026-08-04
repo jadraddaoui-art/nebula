@@ -316,8 +316,8 @@ var (
 
 // newPacket validates and parses the interesting bits for the firewall out of the ip and sub protocol headers
 func newPacket(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
-	// fp is reused across packets; reset the parse byproducts here so a
-	// parser's early-error return can't leak the previous packet's offsets.
+	// fp is reused across packets; reset the parse byproducts so an early-error return cannot
+	// leak the previous packet's offsets.
 	fp.IPHdrLen = 0
 	fp.FragAny = false
 	if len(data) < 1 {
@@ -389,8 +389,8 @@ func parseV6(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
 			}
 
 			fp.Protocol = uint8(proto)
-			// offset is the L4 header start: 40 for a plain packet, past the
-			// extension chain otherwise. The coalescer only accepts 40.
+			// offset is the L4 header start: 40 for a plain packet, past the extension chain
+			// otherwise. The coalescer only accepts 40.
 			fp.IPHdrLen = offset
 			if incoming {
 				fp.RemotePort = binary.BigEndian.Uint16(data[offset : offset+2])
@@ -409,8 +409,7 @@ func parseV6(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
 				return ErrIPv6PacketTooShort
 			}
 
-			// Either way this packet is a fragment shape the coalescer must
-			// not touch, first fragment included.
+			// A fragment shape the coalescer must not touch either way, first fragment included.
 			fp.FragAny = true
 
 			// Check if this is the first fragment
@@ -471,8 +470,8 @@ func parseV4(data []byte, incoming bool, fp *firewall.ParsedPacket) error {
 	// Check if this is the second or further fragment of a fragmented packet.
 	flagsfrags := binary.BigEndian.Uint16(data[6:8])
 	fp.Fragment = (flagsfrags & 0x1FFF) != 0
-	// Any fragmentation at all (MF or offset): first fragments have readable
-	// ports for the firewall but must never be coalesced.
+	// Any fragmentation at all (MF or offset): first fragments have readable ports for the
+	// firewall but must never be coalesced.
 	fp.FragAny = (flagsfrags & 0x3fff) != 0
 	fp.IPHdrLen = ihl
 
