@@ -129,9 +129,3 @@ In addition, Nebula can be built using the [BoringCrypto GOEXPERIMENT](https://g
 
 This is not the recommended default deployment, but may be useful based on your compliance requirements.
 
-## Credits
-
-Nebula was created at Slack Technologies, Inc by Nate Brown and Ryan Huber, with contributions from Oliver Fross, Alan Lam, Wade Simmons, and Lining Wang.
-
-
-
